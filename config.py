@@ -4,8 +4,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD")
 
-EMBEDDING_MODEL = "gemini-embedding-2-preview"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
 CHAT_MODEL = "gemini-3.5-flash-lite"
 
 CHUNK_SIZE = 1000
