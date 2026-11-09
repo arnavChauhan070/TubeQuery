@@ -9,6 +9,7 @@ from langchain_core.runnables import RunnableParallel, RunnablePassthrough, Runn
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core import documents
 import re,time,os
+from fastapi import HTTPException
 
 #Ingestion
 
@@ -17,7 +18,6 @@ import re,time,os
 #Variables
 embedding_model_name = EMBEDDING_MODEL
 api_key = GOOGLE_API_KEY
-youtube_url = "https://youtu.be/4Vz6L8B73i4?si=GGOJm9uOvEhzS2Cr"
 chat_model = CHAT_MODEL
 
 
@@ -61,7 +61,8 @@ def fetch_transcript(video_id,lang):
         transcript = " ".join(chunk["text"] for chunk in raw_transcript)
         return transcript
     except Exception as e:
-        print(f"Exception Caught \n{e}")
+        raise HTTPException(status_code=503,detail=f"Fetching of Transcript Failed \n{e}")
+
 
 
 
@@ -70,7 +71,27 @@ splitter = RecursiveCharacterTextSplitter(
     chunk_overlap = CHUNK_OVERLAP
 )
 
-def ingestion(video_id : str,lang : list[str] = ["en"]):
+def get_embedding_model():
+    return GoogleGenerativeAIEmbeddings(
+        model = embedding_model_name,
+        api_key = api_key
+        )
+
+def load_vector_store(index_dir):
+
+    embedding_model = get_embedding_model()
+    print("Loading Old FAISS")
+    return FAISS.load_local(
+        folder_path=index_dir,
+        embeddings=embedding_model,
+        allow_dangerous_deserialization=True
+                )
+def get_faiss_path(youtube_url):
+   youtube_idx = extract_video_id(youtube_url)
+   return os.path.join("faiss_idx",youtube_idx)
+
+#Ingestion pipeline starts
+def ingestion(video_url : str,lang : list[str] = ["en"]):
     """
     1. Extract YOUTUBE ID
     2. Gets its TRANSCRIPTION by youtube api
@@ -78,24 +99,14 @@ def ingestion(video_id : str,lang : list[str] = ["en"]):
     4. Create its Embedding
     5. Store into Vector_Store
     """
-    video_id = extract_video_id(video_id)
-
-    embedding_model = GoogleGenerativeAIEmbeddings(
-    model = embedding_model_name,
-    api_key = api_key
-    )
-
+    video_id = extract_video_id(video_url)
+    youtube_idx = video_id
     # this just creates a string with name faiss_idx/video_id
 
-    index_dir = os.path.join("faiss_idx",video_id)
-
+    index_dir = get_faiss_path(video_url)
     if os.path.exists(index_dir):
-        print("Loading Faiss")
-        return FAISS.load_local(
-            index_name=index_dir,
-            embeddings=embedding_model,
-            allow_dangerous_deserialization=True
-        )
+        return load_vector_store(index_dir)
+    
     
 
     transcript_text = fetch_transcript(video_id=video_id,lang=lang)
@@ -110,7 +121,7 @@ def ingestion(video_id : str,lang : list[str] = ["en"]):
     print("number of chunks : ",len(chunks))
 
    
-    
+    embedding_model = get_embedding_model()
     vector_store = vector_embeddings(chunks=chunks,embedding_model=embedding_model)
     vector_store.save_local(index_dir)
     return vector_store
@@ -149,74 +160,85 @@ def vector_embeddings(chunks,embedding_model):
             
             time.sleep(30)
         except Exception as e:
-            print(f"Exception Caught : {e}")
-            break
+            raise HTTPException(status_code=503,detail=f"Vector Emedding Failed !! /n {e}")
+
         
 
     return vector_store
 
-
-
-    # vector_Store = FAISS.from_documents(
-    # documents=chunks,
-    # embedding=emedding_model
-    # )
 def retriever_formatting(retireived_docs : documents):
-    return "/n/n".join(docs.page_content for docs in retireived_docs)
+    return "\n\n".join(docs.page_content for docs in retireived_docs)
 
 #ingestion call
-vector_store = ingestion(youtube_url)
-
-# Step 2 Retirevier 
-
-retriever = vector_store.as_retriever(
-    search_type = RETRIEVER_SEARCH_TYPE,
-    search_kwargs = {"k" : RETRIEVAL_K }
-)
+#vector_store = ingestion(youtube_url)
 
 
-#step 3 augmentation
+
+def run_chain(ques : str,vector_store):
 
 
-llm = ChatGoogleGenerativeAI(
-    model = chat_model,
-    temperature = 0.2,
-    google_api_key = api_key
-)
-
-prompt = PromptTemplate(
-    template="""
-     You are helpful assistant.
-     Your task is to give answer to the question from the given context only.
-     If the context is not sufficent , just return "I DON'T KNOW :( "
-
-     {context}
-     Question : {question}
-""",
-    input_variables = ['context','question']
-)
+    # Step 1 get the local vector_database load
+    #idx = os.join("faiss_idx",youtube_idx)
 
 
-#Chain building
+    # Step 2 Retirevier 
 
-"""
-Everything inside `RunnableParallel` must be a Runnable or something 
-LangChain can coerce into a Runnable.
-Built-in LangChain components, such as retrievers and prompts, 
-already implement the Runnable interface.
-Custom Python functions are not automatically Runnables, 
-so we can wrap them using `RunnableLambda` to make them compatible 
-with LangChain's Runnable pipeline.
-"""
-parallel_chain = RunnableParallel(
-    {
-       "context" : retriever | RunnableLambda(retriever_formatting),
-       "question" : RunnablePassthrough()
-    }
-)
-str_parser = StrOutputParser()
-main_chain = parallel_chain | prompt | llm | str_parser
-ques = "According to Dr. Sahar Yousef, how long should an ideal focused work block be before taking a break, and how long should the break last?"
-res = main_chain.invoke(ques)
 
-print(res)
+
+    retriever = vector_store.as_retriever(
+        search_type = RETRIEVER_SEARCH_TYPE,
+        search_kwargs = {"k" : RETRIEVAL_K }
+    )
+
+    docs = retriever.invoke(ques)
+
+    if docs is None:
+        print("No chunk Retreived")
+    else:
+        for i in docs:
+            print(i,end = "\n")
+
+    #step 3 augmentation
+
+
+    llm = ChatGoogleGenerativeAI(
+        model = chat_model,
+        temperature = 0.2,
+        google_api_key = api_key
+    )
+
+    prompt = PromptTemplate(
+        template="""
+        You are helpful assistant.
+        Your task is to give answer to the question from the given context only.
+        If the context is not sufficent , just return "I DON'T KNOW :( "
+
+        {context}
+        Question : {question}
+    """,
+        input_variables = ['context','question']
+    )
+
+
+    #Chain building
+
+    """
+    Everything inside `RunnableParallel` must be a Runnable or something 
+    LangChain can coerce into a Runnable.
+    Built-in LangChain components, such as retrievers and prompts, 
+    already implement the Runnable interface.
+    Custom Python functions are not automatically Runnables, 
+    so we can wrap them using `RunnableLambda` to make them compatible 
+    with LangChain's Runnable pipeline.
+    """
+    parallel_chain = RunnableParallel(
+        {
+        "context" : retriever | RunnableLambda(retriever_formatting),
+        "question" : RunnablePassthrough()
+        }
+    )
+    str_parser = StrOutputParser()
+    main_chain = parallel_chain | prompt | llm | str_parser
+    res = main_chain.invoke(ques)
+    print("END REACHED!!")
+    return res
